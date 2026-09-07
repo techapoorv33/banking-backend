@@ -2,7 +2,7 @@ const transactionModel = require("../models/transaction.model");
 const ledgerModel = require("../models/ledger.model");
 const accountModel = require("../models/account.model");
 const emailService = require("../services/email.service");
-
+const mongoose = require("mongoose");
 /**
  * create a new transaction
  * 10 steps:
@@ -65,4 +65,62 @@ async function createTransaction(req, res) {
             return res.status(500).json({ message: "Transaction has been reversed, please retry", });
         }
     }
+
+    // Step 3: check account existence and status
+
+    if(fromUserAccount.status !== "ACTIVE" || toUserAccount.status !== "ACTIVE") {
+        return res.status(400).json({ message: "Both accounts must be active to perform a transaction" });
+    }
+
+    // Step 4: derive sender balance from ledger
+
+    const balance = await fromUserAccount.getBalance();
+
+    if(balance < amount) {
+        return res.status(400).json({ message: `Insufficient balance. Current balance is ${balance}. Requested amount is ${amount}` });
+    }
+
+    // Step 5: create transaction(PENDING)
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    const transaction = await transactionModel.create({
+        fromAccount,
+        toAccount,
+        amount,
+        idempotencyKey,
+        status: "PENDING"
+    }, { session } );
+
+    const debitLedgerEntry = await ledgerModel.create({
+        account: fromAccount,
+        transaction: transaction._id,
+        type: "DEBIT",
+        amount: amount
+    }, { session });
+
+    const creditLedgerEntry = await ledgerModel.create({
+        account: toAccount,
+        transaction: transaction._id,
+        type: "CREDIT",
+        amount: amount
+    }, { session });
+
+    transaction.status = "COMPLETED";
+    await transaction.save({ session });
+
+    await session.commitTransaction();
+    session.endSession();
+
+    // Step 10: send email notification to sender and receiver
+
+    await emailService.sendTransactionEmail(req.user.email, req.user.name, amount, toAccount);
+
+    return res.status(201).json({ message: "Transaction completed successfully", transaction });
+
+}
+
+module.exports = {
+    createTransaction
 }
